@@ -1,0 +1,119 @@
+<#
+.SYNOPSIS 
+ Orphaned Disk Notification Runbook (Test Mode with Styled Email)
+
+.DESCRIPTION 
+ Enumerates all subscriptions and Managed Disks.
+ Identifies unattached (orphaned) disks (not linked to any VM).
+ Sends email notification to OwnerEmail (from Azure tags) via SendGrid.
+ Safe Test Mode: no deletion performed.
+ Email content formatted in HTML using Georgia font and table layout.
+#>
+
+# Import Az modules
+Import-Module Az.Accounts
+Import-Module Az.Compute
+
+# Connect to Azure using Managed Identity
+Connect-AzAccount -Identity
+
+# Get SendGrid API key from Automation variable
+$SendGridApiKey = Get-AutomationVariable -Name "SendGridApiKey"
+$FromEmail = "azureautomation@0dhbq.onmicrosoft.com"
+
+# Function to send email via SendGrid (HTML format)
+function Send-Email {
+    param (
+        [string]$ToEmail,
+        [string]$Subject,
+        [string]$BodyHtml
+    )
+
+    $BodyJson = @{
+        personalizations = @(@{to = @(@{email = $ToEmail})})
+        from = @{email = $FromEmail}
+        subject = $Subject
+        content = @(@{type = "text/html"; value = $BodyHtml})
+    }
+
+    $jsonBody = $BodyJson | ConvertTo-Json -Depth 4
+
+    try {
+        Invoke-RestMethod -Uri "https://api.sendgrid.com/v3/mail/send" `
+            -Method Post `
+            -Headers @{
+                "Authorization" = "Bearer $SendGridApiKey"
+                "Content-Type"  = "application/json"
+            } `
+            -Body $jsonBody
+
+        Write-Host "Email sent to $ToEmail"
+    }
+    catch {
+        Write-Host "WARNING: Failed to send email to $ToEmail"
+        Write-Host "ERROR DETAILS: $($_.Exception.Message)"
+    }
+}
+
+# Get all subscriptions
+$subscriptions = Get-AzSubscription
+
+foreach ($sub in $subscriptions) {
+    Set-AzContext -SubscriptionId $sub.Id
+    Write-Host "Checking subscription: $($sub.Name) [$($sub.Id)]"
+
+    $disks = Get-AzDisk
+    foreach ($disk in $disks) {
+        # Skip attached disks
+        if ($disk.ManagedBy) { continue }
+
+        # Get Disk as AzResource for tag access
+        $diskResource = Get-AzResource -ResourceId $disk.Id
+
+        # Get OwnerEmail from tags or fallback
+        $ownerEmail = $null
+        if ($diskResource.Tags -and $diskResource.Tags.ContainsKey("OwnerEmail")) {
+            $ownerEmail = $diskResource.Tags["OwnerEmail"]
+        }
+
+        if (-not $ownerEmail) {
+            Write-Host "WARNING: OwnerEmail tag not found for Disk $($disk.Name). Using default email."
+            $ownerEmail = "jeni01anto@gmail.com"
+        }
+
+        # Prepare HTML email body with table layout
+        $bodyHtml = @"
+<html>
+  <body style="font-family: Georgia, serif; font-size:14px; color:#333;">
+    <p>Dear Owner,</p>
+    <p>
+      The following <b style="color:red;">Managed Disk</b> in your subscription is currently <b>unattached (orphaned)</b> and may incur unnecessary cost:
+    </p>
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse; font-family: Georgia, serif;">
+      <tr style="background-color:#f2f2f2;">
+        <th>Property</th>
+        <th>Value</th>
+      </tr>
+      <tr><td><b>Disk Name</b></td><td>$($disk.Name)</td></tr>
+      <tr><td><b>Resource Group</b></td><td>$($disk.ResourceGroupName)</td></tr>
+      <tr><td><b>Subscription</b></td><td>$($sub.Name)</td></tr>
+      <tr><td><b>Disk Size</b></td><td>$($disk.DiskSizeGb) GB</td></tr>
+      <tr><td><b>Disk SKU</b></td><td>$($disk.Sku.Name)</td></tr>
+    </table>
+    <p>
+      Our Automation process will <b>delete this Disk after 7 days</b> unless it is re-attached or marked with <i>DO NOT DELETE</i>.
+    </p>
+    <p style="margin-top:20px;">Regards,<br/>Azure Automation Team</p>
+  </body>
+</html>
+"@
+
+        # Send notification email
+        Send-Email -ToEmail $ownerEmail -Subject "Orphaned Disk Notification - $($disk.Name)" -BodyHtml $bodyHtml
+
+        # TEST MODE: Do NOT delete Disk
+        Write-Host "TEST MODE: Disk $($disk.Name) is orphaned. No deletion performed."
+    }
+}
+
+Write-Host "Orphaned Disk notification runbook completed."
