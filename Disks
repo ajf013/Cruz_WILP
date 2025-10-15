@@ -1,27 +1,23 @@
 <#
 .SYNOPSIS 
- Orphaned Disk Notification Runbook (Test Mode with Styled Email)
+ Orphaned Disk Notification & Cleanup Runbook
 
 .DESCRIPTION 
- Enumerates all subscriptions and Managed Disks.
- Identifies unattached (orphaned) disks (not linked to any VM).
- Sends email notification to OwnerEmail (from Azure tags) via SendGrid.
- Safe Test Mode: no deletion performed.
- Email content formatted in HTML using Georgia font and table layout.
+ Identifies unattached (orphaned) managed disks across all subscriptions.
+ Tags them with 'OrphanedSince' if not already tagged.
+ Sends reminder emails on Day 7, 5, 3, 1.
+ Deletes disk on Day 0 and emails cost savings in ₹ INR.
 #>
 
-# Import Az modules
 Import-Module Az.Accounts
 Import-Module Az.Compute
+Import-Module Az.Resources
 
-# Connect to Azure using Managed Identity
 Connect-AzAccount -Identity
 
-# Get SendGrid API key from Automation variable
 $SendGridApiKey = Get-AutomationVariable -Name "SendGridApiKey"
 $FromEmail = "azureautomation@0dhbq.onmicrosoft.com"
 
-# Function to send email via SendGrid (HTML format)
 function Send-Email {
     param (
         [string]$ToEmail,
@@ -38,6 +34,9 @@ function Send-Email {
 
     $jsonBody = $BodyJson | ConvertTo-Json -Depth 4
 
+    Write-Host "Email Preview:"
+    Write-Host $BodyHtml
+
     try {
         Invoke-RestMethod -Uri "https://api.sendgrid.com/v3/mail/send" `
             -Method Post `
@@ -47,47 +46,80 @@ function Send-Email {
             } `
             -Body $jsonBody
 
-        Write-Host "Email sent to $ToEmail"
+        Write-Host "✅ Email sent to $ToEmail"
     }
     catch {
-        Write-Host "WARNING: Failed to send email to $ToEmail"
-        Write-Host "ERROR DETAILS: $($_.Exception.Message)"
+        Write-Host "⚠️ WARNING: Failed to send email to $ToEmail"
+        Write-Host ("ERROR DETAILS: " + $_.Exception.Message)
+        Write-Host ("FULL ERROR OBJECT: " + ($_ | Out-String))
     }
 }
 
-# Get all subscriptions
+function Estimate-Cost {
+    param (
+        [int]$SizeGB,
+        [string]$Sku
+    )
+    switch ($Sku) {
+        "Standard_LRS" { return [math]::Round($SizeGB * 4.5, 2) }     # ₹4.5/GB
+        "Premium_LRS"  { return [math]::Round($SizeGB * 10.5, 2) }    # ₹10.5/GB
+        default        { return [math]::Round($SizeGB * 7.5, 2) }     # ₹7.5/GB
+    }
+}
+
+$today = Get-Date
 $subscriptions = Get-AzSubscription
 
 foreach ($sub in $subscriptions) {
     Set-AzContext -SubscriptionId $sub.Id
-    Write-Host "Checking subscription: $($sub.Name) [$($sub.Id)]"
+    Write-Host "🔍 Checking subscription: $($sub.Name)"
 
     $disks = Get-AzDisk
     foreach ($disk in $disks) {
-        # Skip attached disks
         if ($disk.ManagedBy) { continue }
 
-        # Get Disk as AzResource for tag access
         $diskResource = Get-AzResource -ResourceId $disk.Id
+        $tags = $diskResource.Tags
 
-        # Get OwnerEmail from tags or fallback
-        $ownerEmail = $null
-        if ($diskResource.Tags -and $diskResource.Tags.ContainsKey("OwnerEmail")) {
-            $ownerEmail = $diskResource.Tags["OwnerEmail"]
+        $ownerEmail = if ($tags.ContainsKey("OwnerEmail")) { $tags["OwnerEmail"] } else { "jeni01anto@gmail.com" }
+
+        if (-not $tags.ContainsKey("OrphanedSince")) {
+            $tags["OrphanedSince"] = $today.ToString("yyyy-MM-dd")
+            Set-AzResource -ResourceId $disk.Id -Tag $tags -Force
+            Write-Host "🏷️ Tagged disk $($disk.Name) with OrphanedSince=$($tags["OrphanedSince"])"
+            continue
         }
 
-        if (-not $ownerEmail) {
-            Write-Host "WARNING: OwnerEmail tag not found for Disk $($disk.Name). Using default email."
-            $ownerEmail = "jeni01anto@gmail.com"
-        }
+# TESTING ONLY: Simulate different reminder stages
+# Uncomment the one you want to test
 
-        # Prepare HTML email body with table layout
-        $bodyHtml = @"
+# $tags["OrphanedSince"] = ($today.AddDays(-0)).ToString("yyyy-MM-dd")  # Day 7
+# $tags["OrphanedSince"] = ($today.AddDays(-2)).ToString("yyyy-MM-dd")  # Day 5
+# $tags["OrphanedSince"] = ($today.AddDays(-4)).ToString("yyyy-MM-dd")  # Day 3
+# $tags["OrphanedSince"] = ($today.AddDays(-6)).ToString("yyyy-MM-dd")  # Day 1
+# $tags["OrphanedSince"] = ($today.AddDays(-7)).ToString("yyyy-MM-dd")  # Day 0 (deletion)
+
+        Set-AzResource -ResourceId $disk.Id -Tag $tags -Force
+
+        $orphanedDate = [datetime]::ParseExact($tags["OrphanedSince"], "yyyy-MM-dd", $null)
+        $daysOrphaned = ($today - $orphanedDate).Days
+        $daysLeft = 7 - $daysOrphaned
+
+        if ($daysLeft -in @(7,5,3,1)) {
+            switch ($daysLeft) {
+                5 { $note = "This is a reminder notification (5th day)." }
+                3 { $note = "This is a reminder notification (3rd day)." }
+                1 { $note = "This is the final reminder before deletion." }
+                default { $note = "This is the first notification (7th day)." }
+            }
+
+            $subject = "Reminder: Disk $($disk.Name) will be deleted in $daysLeft day(s)"
+            $bodyHtml = @"
 <html>
   <body style="font-family: Georgia, serif; font-size:14px; color:#333;">
-    <p>Dear Owner,</p>
+    <p>Dear Owner, Good Day...</p>
     <p>
-      The following <b style="color:red;">Managed Disk</b> in your subscription is currently <b>unattached (orphaned)</b> and may incur unnecessary cost:
+      This is to notify you that the following <b style="color:red;">Managed Disk</b> in your subscription is currently in <b>unattached (orphaned)</b> and may incur unnecessary cost:
     </p>
     <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse; font-family: Georgia, serif;">
       <tr style="background-color:#f2f2f2;">
@@ -101,19 +133,51 @@ foreach ($sub in $subscriptions) {
       <tr><td><b>Disk SKU</b></td><td>$($disk.Sku.Name)</td></tr>
     </table>
     <p>
-      Our Automation process will <b>delete this Disk after 7 days</b> unless it is re-attached or marked with <i>DO NOT DELETE</i>.
+      Our Automation process will <b>delete this Disk after $daysLeft day(s)</b> unless it is re-attached or marked with <i>DO NOT DELETE</i>. $note
     </p>
     <p style="margin-top:20px;">Regards,<br/>Azure Automation Team</p>
   </body>
 </html>
 "@
+            Send-Email -ToEmail $ownerEmail -Subject $subject -BodyHtml $bodyHtml
+        }
 
-        # Send notification email
-        Send-Email -ToEmail $ownerEmail -Subject "Orphaned Disk Notification - $($disk.Name)" -BodyHtml $bodyHtml
+        elseif ($daysLeft -eq 0) {
+            $monthlyCost = Estimate-Cost -SizeGB $disk.DiskSizeGb -Sku $disk.Sku.Name
+            $dailyCost = [math]::Round($monthlyCost / 30, 2)
+            $totalSaved = [math]::Round($dailyCost * $daysOrphaned, 2)
 
-        # TEST MODE: Do NOT delete Disk
-        Write-Host "TEST MODE: Disk $($disk.Name) is orphaned. No deletion performed."
+            Remove-AzDisk -ResourceGroupName $disk.ResourceGroupName -DiskName $disk.Name -Force
+            Write-Host "🗑️ Deleted disk $($disk.Name)"
+
+            $subject = "Deleted: Orphaned Disk $($disk.Name)"
+            $bodyHtml = @"
+<html>
+  <body style="font-family: Georgia, serif; font-size:14px; color:#333;">
+    <p>Dear Owner,</p>
+    <p>
+      The following disk has been <b style="color:red;">deleted</b> after 7 days of being unattached. This action helps reduce unnecessary cost and optimize your cloud usage.
+    </p>
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse; font-family: Georgia, serif;">
+      <tr style="background-color:#f2f2f2;">
+        <th>Property</th>
+        <th>Value</th>
+      </tr>
+      <tr><td><b>Disk Name</b></td><td>$($disk.Name)</td></tr>
+      <tr><td><b>Resource Group</b></td><td>$($disk.ResourceGroupName)</td></tr>
+      <tr><td><b>Subscription</b></td><td>$($sub.Name)</td></tr>
+      <tr><td><b>Disk Size</b></td><td>$($disk.DiskSizeGb) GB</td></tr>
+      <tr><td><b>Disk SKU</b></td><td>$($disk.Sku.Name)</td></tr>
+      <tr><td><b>Cost Saved</b></td><td>INR$totalSaved</td></tr>
+    </table>
+    <p style="color:green;"><b>Disk deleted successfully.</b> Thank you for helping optimize cloud costs!</p>
+    <p>Regards,<br/>Azure Automation Team<br/></p>
+  </body>
+</html>
+"@
+            Send-Email -ToEmail $ownerEmail -Subject $subject -BodyHtml $bodyHtml
+        }
     }
 }
 
-Write-Host "Orphaned Disk notification runbook completed."
+Write-Host "✅ Orphaned disk cleanup completed."
