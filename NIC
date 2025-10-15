@@ -1,0 +1,171 @@
+<#
+.SYNOPSIS 
+ Orphaned NIC Notification & Cleanup Runbook
+
+.DESCRIPTION 
+ Identifies unattached (orphaned) network interface cards (NICs) across all subscriptions.
+ Tags them with 'OrphanedSince' if not already tagged.
+ Sends reminder emails on Day 7, 5, 3, 1.
+ Deletes NIC on Day 0 and emails cost savings in ₹ INR.
+#>
+
+Import-Module Az.Accounts
+Import-Module Az.Network
+Import-Module Az.Resources
+
+Connect-AzAccount -Identity
+
+$SendGridApiKey = Get-AutomationVariable -Name "SendGridApiKey"
+$FromEmail = "azureautomation@0dhbq.onmicrosoft.com"
+
+function Send-Email {
+    param (
+        [string]$ToEmail,
+        [string]$Subject,
+        [string]$BodyHtml
+    )
+
+    $BodyJson = @{
+        personalizations = @(@{to = @(@{email = $ToEmail})})
+        from = @{email = $FromEmail}
+        subject = $Subject
+        content = @(@{type = "text/html"; value = $BodyHtml})
+    }
+
+    $jsonBody = $BodyJson | ConvertTo-Json -Depth 4
+
+    Write-Host "Email Preview:"
+    Write-Host $BodyHtml
+
+    try {
+        Invoke-RestMethod -Uri "https://api.sendgrid.com/v3/mail/send" `
+            -Method Post `
+            -Headers @{
+                "Authorization" = "Bearer $SendGridApiKey"
+                "Content-Type"  = "application/json"
+            } `
+            -Body $jsonBody
+
+        Write-Host "✅ Email sent to $ToEmail"
+    }
+    catch {
+        Write-Host "⚠️ WARNING: Failed to send email to $ToEmail"
+        Write-Host ("ERROR DETAILS: " + $_.Exception.Message)
+        Write-Host ("FULL ERROR OBJECT: " + ($_ | Out-String))
+    }
+}
+
+function Estimate-NICCost {
+    return 2.00  # ₹2/day flat estimate per NIC
+}
+
+$today = Get-Date
+$subscriptions = Get-AzSubscription
+
+foreach ($sub in $subscriptions) {
+    Set-AzContext -SubscriptionId $sub.Id
+    Write-Host "🔍 Checking subscription: $($sub.Name)"
+
+    $nics = Get-AzNetworkInterface | Where-Object { -not $_.VirtualMachine }
+
+    foreach ($nic in $nics) {
+        $nicResource = Get-AzResource -ResourceId $nic.Id
+        $tags = $nicResource.Tags
+
+        $ownerEmail = if ($tags.ContainsKey("OwnerEmail")) { $tags["OwnerEmail"] } else { "jeni01anto@gmail.com" }
+
+        if (-not $tags.ContainsKey("OrphanedSince")) {
+            $tags["OrphanedSince"] = $today.ToString("yyyy-MM-dd")
+            Set-AzResource -ResourceId $nic.Id -Tag $tags -Force
+            Write-Host "🏷️ Tagged NIC $($nic.Name) with OrphanedSince=$($tags["OrphanedSince"])"
+            continue
+        }
+        # TESTING ONLY: Simulate different reminder stages for NIC
+        # Uncomment the one you want to test
+
+        # $tags["OrphanedSince"] = ($today.AddDays(-0)).ToString("yyyy-MM-dd")  # Day 7
+        # $tags["OrphanedSince"] = ($today.AddDays(-2)).ToString("yyyy-MM-dd")  # Day 5
+        # $tags["OrphanedSince"] = ($today.AddDays(-4)).ToString("yyyy-MM-dd")  # Day 3
+        # $tags["OrphanedSince"] = ($today.AddDays(-6)).ToString("yyyy-MM-dd")  # Day 1
+        # $tags["OrphanedSince"] = ($today.AddDays(-7)).ToString("yyyy-MM-dd")  # Day 0 (deletion)
+
+        Set-AzResource -ResourceId $nic.Id -Tag $tags -Force
+
+
+        $orphanedDate = [datetime]::ParseExact($tags["OrphanedSince"], "yyyy-MM-dd", $null)
+        $daysOrphaned = ($today - $orphanedDate).Days
+        $daysLeft = 7 - $daysOrphaned
+
+        if ($daysLeft -in @(7,5,3,1)) {
+            switch ($daysLeft) {
+                5 { $note = "This is a reminder notification (5th day)." }
+                3 { $note = "This is a reminder notification (3rd day)." }
+                1 { $note = "This is the final reminder before deletion." }
+                default { $note = "This is the first notification (7th day)." }
+            }
+
+            $subject = "Reminder: NIC $($nic.Name) will be deleted in $daysLeft day(s)"
+            $bodyHtml = @"
+<html>
+  <body style="font-family: Georgia, serif; font-size:14px; color:#333;">
+    <p>Dear Owner, Good Day...</p>
+    <p>
+      The following <b style="color:red;">Network Interface Card (NIC)</b> is unattached and may incur unnecessary cost:
+    </p>
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse; font-family: Georgia, serif;">
+      <tr style="background-color:#f2f2f2;">
+        <th>Property</th>
+        <th>Value</th>
+      </tr>
+      <tr><td><b>NIC Name</b></td><td>$($nic.Name)</td></tr>
+      <tr><td><b>Resource Group</b></td><td>$($nic.ResourceGroupName)</td></tr>
+      <tr><td><b>Subscription</b></td><td>$($sub.Name)</td></tr>
+      <tr><td><b>Location</b></td><td>$($nic.Location)</td></tr>
+    </table>
+    <p>
+      Our Automation process will <b>delete this NIC after $daysLeft day(s)</b> unless it is re-attached or marked with <i>DO NOT DELETE</i>. $note
+    </p>
+    <p style="margin-top:20px;">Regards,<br/>Azure Automation Team</p>
+  </body>
+</html>
+"@
+            Send-Email -ToEmail $ownerEmail -Subject $subject -BodyHtml $bodyHtml
+        }
+
+        elseif ($daysLeft -eq 0) {
+            $dailyCost = Estimate-NICCost
+            $totalSaved = [math]::Round($dailyCost * $daysOrphaned, 2)
+
+            Remove-AzNetworkInterface -Name $nic.Name -ResourceGroupName $nic.ResourceGroupName -Force
+            Write-Host "🗑️ Deleted NIC $($nic.Name)"
+
+            $subject = "Deleted: Orphaned NIC $($nic.Name)"
+            $bodyHtml = @"
+<html>
+  <body style="font-family: Georgia, serif; font-size:14px; color:#333;">
+    <p>Dear Owner,</p>
+    <p>
+      The following NIC has been <b style="color:red;">deleted</b> after 7 days of being unattached. This helps reduce unnecessary cost.
+    </p>
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse; font-family: Georgia, serif;">
+      <tr style="background-color:#f2f2f2;">
+        <th>Property</th>
+        <th>Value</th>
+      </tr>
+      <tr><td><b>NIC Name</b></td><td>$($nic.Name)</td></tr>
+      <tr><td><b>Resource Group</b></td><td>$($nic.ResourceGroupName)</td></tr>
+      <tr><td><b>Subscription</b></td><td>$($sub.Name)</td></tr>
+      <tr><td><b>Location</b></td><td>$($nic.Location)</td></tr>
+      <tr><td><b>Cost Saved</b></td><td>INR $totalSaved</td></tr>
+    </table>
+    <p style="color:green;"><b>NIC deleted successfully.</b> Thank you for helping optimize cloud costs!</p>
+    <p>Regards,<br/>Azure Automation Team<br/></p>
+  </body>
+</html>
+"@
+            Send-Email -ToEmail $ownerEmail -Subject $subject -BodyHtml $bodyHtml
+        }
+    }
+}
+
+Write-Host "✅ Orphaned NIC cleanup completed."
