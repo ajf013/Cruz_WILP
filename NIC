@@ -80,6 +80,7 @@ foreach ($sub in $subscriptions) {
             Write-Host "🏷️ Tagged NIC $($nic.Name) with OrphanedSince=$($tags["OrphanedSince"])"
             continue
         }
+
         # TESTING ONLY: Simulate different reminder stages for NIC
         # Uncomment the one you want to test
 
@@ -91,10 +92,12 @@ foreach ($sub in $subscriptions) {
 
         Set-AzResource -ResourceId $nic.Id -Tag $tags -Force
 
-
         $orphanedDate = [datetime]::ParseExact($tags["OrphanedSince"], "yyyy-MM-dd", $null)
         $daysOrphaned = ($today - $orphanedDate).Days
         $daysLeft = 7 - $daysOrphaned
+        $dailyCost = Estimate-NICCost
+        $totalSaved = [math]::Round($dailyCost * $daysOrphaned, 2)
+        $doNotDelete = $tags.ContainsKey("DO NOT DELETE") -and $tags["DO NOT DELETE"].ToLower() -eq "yes"
 
         if ($daysLeft -in @(7,5,3,1)) {
             switch ($daysLeft) {
@@ -121,10 +124,12 @@ foreach ($sub in $subscriptions) {
       <tr><td><b>Resource Group</b></td><td>$($nic.ResourceGroupName)</td></tr>
       <tr><td><b>Subscription</b></td><td>$($sub.Name)</td></tr>
       <tr><td><b>Location</b></td><td>$($nic.Location)</td></tr>
+      <tr><td><b>Estimated Cost</b></td><td>&#8377;$totalSaved</td></tr>
     </table>
     <p>
       Our Automation process will <b>delete this NIC after $daysLeft day(s)</b> unless it is re-attached or marked with <i>DO NOT DELETE</i>. $note
     </p>
+    <p><b>If deleted, this NIC would save &#8377;$totalSaved.</b></p>
     <p style="margin-top:20px;">Regards,<br/>Azure Automation Team</p>
   </body>
 </html>
@@ -133,14 +138,12 @@ foreach ($sub in $subscriptions) {
         }
 
         elseif ($daysLeft -eq 0) {
-            $dailyCost = Estimate-NICCost
-            $totalSaved = [math]::Round($dailyCost * $daysOrphaned, 2)
+            if (-not $doNotDelete) {
+                Remove-AzNetworkInterface -Name $nic.Name -ResourceGroupName $nic.ResourceGroupName -Force
+                Write-Host "🗑️ Deleted NIC $($nic.Name)"
 
-            Remove-AzNetworkInterface -Name $nic.Name -ResourceGroupName $nic.ResourceGroupName -Force
-            Write-Host "🗑️ Deleted NIC $($nic.Name)"
-
-            $subject = "Deleted: Orphaned NIC $($nic.Name)"
-            $bodyHtml = @"
+                $subject = "Deleted: Orphaned NIC $($nic.Name)"
+                $bodyHtml = @"
 <html>
   <body style="font-family: Georgia, serif; font-size:14px; color:#333;">
     <p>Dear Owner,</p>
@@ -156,14 +159,15 @@ foreach ($sub in $subscriptions) {
       <tr><td><b>Resource Group</b></td><td>$($nic.ResourceGroupName)</td></tr>
       <tr><td><b>Subscription</b></td><td>$($sub.Name)</td></tr>
       <tr><td><b>Location</b></td><td>$($nic.Location)</td></tr>
-      <tr><td><b>Cost Saved</b></td><td>INR $totalSaved</td></tr>
+    <tr><td><b>Cost Saved</b></td><td>&#8377;$totalSaved</td></tr>
     </table>
     <p style="color:green;"><b>NIC deleted successfully.</b> Thank you for helping optimize cloud costs!</p>
     <p>Regards,<br/>Azure Automation Team<br/></p>
   </body>
 </html>
 "@
-            Send-Email -ToEmail $ownerEmail -Subject $subject -BodyHtml $bodyHtml
+                Send-Email -ToEmail $ownerEmail -Subject $subject -BodyHtml $bodyHtml
+            }
         }
     }
 }
