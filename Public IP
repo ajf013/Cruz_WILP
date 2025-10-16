@@ -1,0 +1,175 @@
+<#
+.SYNOPSIS 
+ Orphaned Public IP Notification & Cleanup Runbook
+
+.DESCRIPTION 
+ Identifies unattached (orphaned) Public IPs across all subscriptions.
+ Tags them with 'OrphanedSince' if not already tagged.
+ Sends reminder emails on Day 7, 5, 3, 1.
+ Deletes Public IP on Day 0 and emails cost savings in ₹ INR.
+#>
+
+Import-Module Az.Accounts
+Import-Module Az.Network
+Import-Module Az.Resources
+
+Connect-AzAccount -Identity
+
+$SendGridApiKey = Get-AutomationVariable -Name "SendGridApiKey"
+$FromEmail = "azureautomation@0dhbq.onmicrosoft.com"
+
+function Send-Email {
+    param (
+        [string]$ToEmail,
+        [string]$Subject,
+        [string]$BodyHtml
+    )
+
+    $BodyJson = @{
+        personalizations = @(@{to = @(@{email = $ToEmail})})
+        from = @{email = $FromEmail}
+        subject = $Subject
+        content = @(@{type = "text/html"; value = $BodyHtml})
+    }
+
+    $jsonBody = $BodyJson | ConvertTo-Json -Depth 4
+
+    Write-Host "Email Preview:"
+    Write-Host $BodyHtml
+
+    try {
+        Invoke-RestMethod -Uri "https://api.sendgrid.com/v3/mail/send" `
+            -Method Post `
+            -Headers @{
+                "Authorization" = "Bearer $SendGridApiKey"
+                "Content-Type"  = "application/json"
+            } `
+            -Body $jsonBody
+
+        Write-Host "✅ Email sent to $ToEmail"
+    }
+    catch {
+        Write-Host "⚠️ WARNING: Failed to send email to $ToEmail"
+        Write-Host ("ERROR DETAILS: " + $_.Exception.Message)
+        Write-Host ("FULL ERROR OBJECT: " + ($_ | Out-String))
+    }
+}
+
+function Estimate-PIPCost {
+    return 1.50  # ₹1.50/day flat estimate per Public IP
+}
+
+$today = Get-Date
+$subscriptions = Get-AzSubscription
+
+foreach ($sub in $subscriptions) {
+    Set-AzContext -SubscriptionId $sub.Id
+    Write-Host "🔍 Checking subscription: $($sub.Name)"
+
+    $pips = Get-AzPublicIpAddress | Where-Object { -not $_.IpConfiguration }
+
+    foreach ($pip in $pips) {
+        $pipResource = Get-AzResource -ResourceId $pip.Id
+        $tags = $pipResource.Tags
+
+        $ownerEmail = if ($tags.ContainsKey("OwnerEmail")) { $tags["OwnerEmail"] } else { "jeni01anto@gmail.com" }
+
+        if (-not $tags.ContainsKey("OrphanedSince")) {
+            $tags["OrphanedSince"] = $today.ToString("yyyy-MM-dd")
+            Set-AzResource -ResourceId $pip.Id -Tag $tags -Force
+            Write-Host "🏷️ Tagged Public IP $($pip.Name) with OrphanedSince=$($tags["OrphanedSince"])"
+            continue
+        }
+
+        # TESTING ONLY: Simulate different reminder stages for Public IP
+        # Uncomment the one you want to test
+
+        # $tags["OrphanedSince"] = ($today.AddDays(-0)).ToString("yyyy-MM-dd")  # Day 7
+        # $tags["OrphanedSince"] = ($today.AddDays(-2)).ToString("yyyy-MM-dd")  # Day 5
+        # $tags["OrphanedSince"] = ($today.AddDays(-4)).ToString("yyyy-MM-dd")  # Day 3
+        # $tags["OrphanedSince"] = ($today.AddDays(-6)).ToString("yyyy-MM-dd")  # Day 1
+        # $tags["OrphanedSince"] = ($today.AddDays(-7)).ToString("yyyy-MM-dd")  # Day 0 (deletion)
+
+        Set-AzResource -ResourceId $pip.Id -Tag $tags -Force
+
+        $orphanedDate = [datetime]::ParseExact($tags["OrphanedSince"], "yyyy-MM-dd", $null)
+        $daysOrphaned = ($today - $orphanedDate).Days
+        $daysLeft = 7 - $daysOrphaned
+        $dailyCost = Estimate-PIPCost
+        $totalSaved = [math]::Round($dailyCost * $daysOrphaned, 2)
+        $doNotDelete = $tags.ContainsKey("DO NOT DELETE") -and $tags["DO NOT DELETE"].ToLower() -eq "yes"
+
+        if ($daysLeft -in @(7,5,3,1)) {
+            switch ($daysLeft) {
+                5 { $note = "This is a reminder notification (5th day)." }
+                3 { $note = "This is a reminder notification (3rd day)." }
+                1 { $note = "This is the final reminder before deletion." }
+                default { $note = "This is the first notification (7th day)." }
+            }
+
+            $subject = "Reminder: Public IP $($pip.Name) will be deleted in $daysLeft day(s)"
+            $bodyHtml = @"
+<html>
+  <body style="font-family: Georgia, serif; font-size:14px; color:#333;">
+    <p>Dear Owner, Good Day...</p>
+    <p>
+      The following <b style="color:red;">Public IP Address</b> is unattached and may incur unnecessary cost:
+    </p>
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse; font-family: Georgia, serif;">
+      <tr style="background-color:#f2f2f2;">
+        <th>Property</th>
+        <th>Value</th>
+      </tr>
+      <tr><td><b>Public IP Name</b></td><td>$($pip.Name)</td></tr>
+      <tr><td><b>Resource Group</b></td><td>$($pip.ResourceGroupName)</td></tr>
+      <tr><td><b>Subscription</b></td><td>$($sub.Name)</td></tr>
+      <tr><td><b>Location</b></td><td>$($pip.Location)</td></tr>
+      <tr><td><b>Estimated Cost</b></td><td>&#8377;$totalSaved</td></tr>
+    </table>
+    <p>
+      Our Automation process will <b>delete this Public IP after $daysLeft day(s)</b> unless it is re-attached or marked with <i>DO NOT DELETE</i>. $note
+    </p>
+    <p><b>If deleted, this Public IP would save &#8377;$totalSaved.</b></p>
+    <p style="margin-top:20px;">Regards,<br/>Azure Automation Team</p>
+  </body>
+</html>
+"@
+            Send-Email -ToEmail $ownerEmail -Subject $subject -BodyHtml $bodyHtml
+        }
+
+        elseif ($daysLeft -eq 0) {
+            if (-not $doNotDelete) {
+                Remove-AzPublicIpAddress -Name $pip.Name -ResourceGroupName $pip.ResourceGroupName -Force
+                Write-Host "🗑️ Deleted Public IP $($pip.Name)"
+
+                $subject = "Deleted: Orphaned Public IP $($pip.Name)"
+                $bodyHtml = @"
+<html>
+  <body style="font-family: Georgia, serif; font-size:14px; color:#333;">
+    <p>Dear Owner,</p>
+    <p>
+      The following Public IP has been <b style="color:red;">deleted</b> after 7 days of being unattached. This helps reduce unnecessary cost.
+    </p>
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse; font-family: Georgia, serif;">
+      <tr style="background-color:#f2f2f2;">
+        <th>Property</th>
+        <th>Value</th>
+      </tr>
+      <tr><td><b>Public IP Name</b></td><td>$($pip.Name)</td></tr>
+      <tr><td><b>Resource Group</b></td><td>$($pip.ResourceGroupName)</td></tr>
+      <tr><td><b>Subscription</b></td><td>$($sub.Name)</td></tr>
+      <tr><td><b>Location</b></td><td>$($pip.Location)</td></tr>
+      <tr><td><b>Cost Saved</b></td><td>&#8377;$totalSaved</td></tr>
+    </table>
+    <p style="color:green;"><b>Public IP deleted successfully.</b> Thank you for helping optimize cloud costs!</p>
+    <p>Regards,<br/>Azure Automation Team<br/></p>
+   </body>
+</html>
+"@
+                Send-Email -ToEmail $ownerEmail -Subject $subject -BodyHtml $bodyHtml
+            }
+        }
+    }
+}
+
+Write-Host "✅ Orphaned NIC cleanup completed."
