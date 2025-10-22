@@ -79,7 +79,6 @@ foreach ($sub in $subscriptions) {
             $tags["OrphanedSince"] = $today.ToString("yyyy-MM-dd")
             Set-AzResource -ResourceId $snapshot.Id -Tag $tags -Force
             Write-Host "🏷️ Tagged Snapshot $($snapshot.Name) with OrphanedSince=$($tags["OrphanedSince"])"
-            continue
         }
 
         # TESTING ONLY: Simulate different reminder stages for Snapshot
