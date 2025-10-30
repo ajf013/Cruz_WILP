@@ -78,7 +78,6 @@ foreach ($sub in $subscriptions) {
             $tags["OrphanedSince"] = $today.ToString("yyyy-MM-dd")
             Set-AzResource -ResourceId $nic.Id -Tag $tags -Force
             Write-Host "🏷️ Tagged NIC $($nic.Name) with OrphanedSince=$($tags["OrphanedSince"])"
-            continue
         }
 
         # TESTING ONLY: Simulate different reminder stages for NIC
@@ -113,7 +112,7 @@ foreach ($sub in $subscriptions) {
   <body style="font-family: Georgia, serif; font-size:14px; color:#333;">
     <p>Dear Owner, Good Day...</p>
     <p>
-      The following <b style="color:red;">Network Interface Card (NIC)</b> is unattached and may incur unnecessary cost:
+      We’ve identified the following orphaned resource <b style="color:red;">Network Interface Card (NIC)</b> under your subscription that is currently unused and not linked to any active services:
     </p>
     <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse; font-family: Georgia, serif;">
       <tr style="background-color:#f2f2f2;">
@@ -127,8 +126,9 @@ foreach ($sub in $subscriptions) {
       <tr><td><b>Estimated Cost</b></td><td>&#8377;$totalSaved</td></tr>
     </table>
     <p>
-      Our Automation process will <b>delete this NIC after $daysLeft day(s)</b> unless it is re-attached or marked with <i>DO NOT DELETE</i>. $note
+      As part of our cleanup initiative to optimize cloud usage and reduce unnecessary costs, this resource will be deleted as per the automation schedule. Our Automation process will <b>delete this NIC after $daysLeft day(s)</b>$note
     </p>
+    <p>If this resource is still required, please tag it with <i>DO NOT DELETE</i> or reattach it to an active service before the resource getting deleted automaticallly.</p>
     <p><b>If deleted, this NIC would save &#8377;$totalSaved.</b></p>
     <p style="margin-top:20px;">Regards,<br/>Azure Automation Team</p>
   </body>
