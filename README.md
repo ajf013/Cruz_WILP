@@ -1,9 +1,9 @@
 # 🧹 Orphaned Resource Clean-Up Through Automation on Azure
 
-![PowerShell](https://media.giphy.com/media/3o7aD2saalBwwftBIY/giphy.gif)
-![Azure](https://media.giphy.com/media/3o7aCTfyhYawdOXcFW/giphy.gif)
-![GitHub](https://media.giphy.com/media/l0MYt5jPR6QX5pnqM/giphy.gif)
-![Gmail](https://media.giphy.com/media/3o6ZtpxSZbQRRnwCKQ/giphy.gif)
+![PowerShell Badge](https://img.shields.io/badge/PowerShell-Automation-blue?logo=powershell&logoColor=white)
+![Azure Badge](https://img.shields.io/badge/Azure-Cloud%20Resources-0078D4?logo=microsoftazure&logoColor=white)
+![GitHub Badge](https://img.shields.io/badge/GitHub-Repository-black?logo=github)
+![Gmail Badge](https://img.shields.io/badge/Gmail-Email%20Notifications-D14836?logo=gmail&logoColor=white)
 
 ## Overview
 
