@@ -22,7 +22,6 @@ Built with PowerShell and Azure Automation, this solution is designed for DevOps
 - 🗑️ Deletes orphaned resources on day 0
 - 💰 Calculates and reports actual cost savings in ₹ INR using `Az.CostManagement`
 - 🌐 Uses SendGrid for email delivery with HTML templates
-- 🇮🇳 Supports cultural personalization (e.g., Tamil greetings, warm tone)
 
 ---
 
