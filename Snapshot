@@ -3,15 +3,17 @@
  Orphaned Snapshot Notification & Cleanup Runbook
 
 .DESCRIPTION 
- Identifies unattached (orphaned) snapshots across all subscriptions.
+ Identifies unattached snapshots across all subscriptions.
  Tags them with 'OrphanedSince' if not already tagged.
  Sends reminder emails on Day 7, 5, 3, 1.
- Deletes snapshot on Day 0 and emails cost savings in ₹ INR.
+ Sends protection notice if DO NOT DELETE = yes.
+ Deletes snapshot on Day 0 and emails actual cost savings in ₹ INR.
 #>
 
 Import-Module Az.Accounts
 Import-Module Az.Compute
 Import-Module Az.Resources
+Import-Module Az.CostManagement
 
 Connect-AzAccount -Identity
 
@@ -55,9 +57,23 @@ function Send-Email {
     }
 }
 
-function Estimate-SnapshotCost {
-    param ([int]$SizeGB)
-    return [math]::Round($SizeGB * 3.5, 2)  # ₹3.5/GB/day estimate
+function Get-ActualSnapshotCost {
+    param (
+        [string]$resourceId,
+        [datetime]$startDate,
+        [datetime]$endDate
+    )
+
+    try {
+        $usageDetails = Get-ConsumptionUsageDetail -StartDate $startDate -EndDate $endDate
+        $snapUsage = $usageDetails | Where-Object { $_.InstanceId -eq $resourceId }
+        $totalCost = ($snapUsage | Measure-Object -Property PreTaxCost -Sum).Sum
+        return [math]::Round($totalCost, 2)
+    }
+    catch {
+        Write-Host "⚠️ Failed to retrieve actual cost for $resourceId. Falling back to estimate."
+        return [math]::Round(1.00 * (($endDate - $startDate).Days), 2)
+    }
 }
 
 $today = Get-Date
@@ -67,37 +83,54 @@ foreach ($sub in $subscriptions) {
     Set-AzContext -SubscriptionId $sub.Id
     Write-Host "🔍 Checking subscription: $($sub.Name)"
 
-    $snapshots = Get-AzSnapshot
+    $snapshots = Get-AzSnapshot | Where-Object { -not $_.DiskId }
 
-    foreach ($snapshot in $snapshots) {
-        $snapshotResource = Get-AzResource -ResourceId $snapshot.Id
-        $tags = $snapshotResource.Tags
+    foreach ($snap in $snapshots) {
+        $snapResource = Get-AzResource -ResourceId $snap.Id
+        $tags = $snapResource.Tags
 
         $ownerEmail = if ($tags.ContainsKey("OwnerEmail")) { $tags["OwnerEmail"] } else { "jeni01anto@gmail.com" }
 
         if (-not $tags.ContainsKey("OrphanedSince")) {
             $tags["OrphanedSince"] = $today.ToString("yyyy-MM-dd")
-            Set-AzResource -ResourceId $snapshot.Id -Tag $tags -Force
-            Write-Host "🏷️ Tagged Snapshot $($snapshot.Name) with OrphanedSince=$($tags["OrphanedSince"])"
+            Set-AzResource -ResourceId $snap.Id -Tag $tags -Force
+            Write-Host "🏷️ Tagged Snapshot $($snap.Name) with OrphanedSince=$($tags["OrphanedSince"])"
         }
 
-        # TESTING ONLY: Simulate different reminder stages for Snapshot
-        # Uncomment the one you want to test
-
-        # $tags["OrphanedSince"] = ($today.AddDays(-0)).ToString("yyyy-MM-dd")  # Day 7
-        # $tags["OrphanedSince"] = ($today.AddDays(-2)).ToString("yyyy-MM-dd")  # Day 5
-        # $tags["OrphanedSince"] = ($today.AddDays(-4)).ToString("yyyy-MM-dd")  # Day 3
-        # $tags["OrphanedSince"] = ($today.AddDays(-6)).ToString("yyyy-MM-dd")  # Day 1
-        # $tags["OrphanedSince"] = ($today.AddDays(-7)).ToString("yyyy-MM-dd")  # Day 0 (deletion)
-
-        Set-AzResource -ResourceId $snapshot.Id -Tag $tags -Force
+        Set-AzResource -ResourceId $snap.Id -Tag $tags -Force
 
         $orphanedDate = [datetime]::ParseExact($tags["OrphanedSince"], "yyyy-MM-dd", $null)
         $daysOrphaned = ($today - $orphanedDate).Days
         $daysLeft = 7 - $daysOrphaned
-        $dailyCost = Estimate-SnapshotCost -SizeGB $snapshot.DiskSizeGB
-        $totalSaved = [math]::Round($dailyCost * $daysOrphaned, 2)
+        $totalSaved = Get-ActualSnapshotCost -resourceId $snap.Id -startDate $orphanedDate -endDate $today
         $doNotDelete = $tags.ContainsKey("DO NOT DELETE") -and $tags["DO NOT DELETE"].ToLower() -eq "yes"
+
+        if ($doNotDelete) {
+            $subject = "Info: Snapshot $($snap.Name) is protected from deletion"
+            $bodyHtml = @"
+<html>
+  <body style='font-family: Georgia, serif; font-size:14px; color:#333;'>
+    <p>Dear Owner,</p>
+    <p>
+      The following <b style='color:green;'>Snapshot</b> is currently unattached but has been tagged with <b>DO NOT DELETE = yes</b>.
+    </p>
+    <table border='1' cellpadding='6' cellspacing='0' style='border-collapse: collapse;'>
+      <tr style='background-color:#f2f2f2;'><th>Property</th><th>Value</th></tr>
+      <tr><td><b>Snapshot Name</b></td><td>$($snap.Name)</td></tr>
+      <tr><td><b>Resource Group</b></td><td>$($snap.ResourceGroupName)</td></tr>
+      <tr><td><b>Subscription</b></td><td>$($sub.Name)</td></tr>
+      <tr><td><b>Location</b></td><td>$($snap.Location)</td></tr>
+      <tr><td><b>Current Cost</b></td><td>&#8377;$totalSaved</td></tr>
+    </table>
+    <p>This resource is <b>excluded from automated deletion</b>. No action is required from your end at the moment.</p>
+    <p>We encourage periodic review to ensure it's still needed. If not, please update the tag value to allow automated cleanup.</p>
+    <p style='margin-top:20px;'>Regards,<br/>Azure Automation Team</p>
+  </body>
+</html>
+"@
+            Send-Email -ToEmail $ownerEmail -Subject $subject -BodyHtml $bodyHtml
+            continue
+        }
 
         if ($daysLeft -in @(7,5,3,1)) {
             switch ($daysLeft) {
@@ -107,62 +140,57 @@ foreach ($sub in $subscriptions) {
                 default { $note = "This is the first notification (7th day)." }
             }
 
-            $subject = "Reminder: Snapshot $($snapshot.Name) will be deleted in $daysLeft day(s)"
+            $subject = "Reminder: Snapshot $($snap.Name) will be deleted in $daysLeft day(s)"
             $bodyHtml = @"
 <html>
-  <body style="font-family: Georgia, serif; font-size:14px; color:#333;">
+  <body style='font-family: Georgia, serif; font-size:14px; color:#333;'>
     <p>Dear Owner, Good Day...</p>
     <p>
-      The following <b style="color:red;">Snapshot</b> is unattached and may incur unnecessary cost:
+    We’ve identified the following orphaned resource <b style='color:red;'>Snapshot</b> under your subscription that is currently unused and not linked to any disk:
     </p>
-    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse; font-family: Georgia, serif;">
-      <tr style="background-color:#f2f2f2;">
-        <th>Property</th>
-        <th>Value</th>
-      </tr>
-      <tr><td><b>Snapshot Name</b></td><td>$($snapshot.Name)</td></tr>
-      <tr><td><b>Resource Group</b></td><td>$($snapshot.ResourceGroupName)</td></tr>
+    <table border='1' cellpadding='6' cellspacing='0' style='border-collapse: collapse;'>
+      <tr style='background-color:#f2f2f2;'><th>Property</th><th>Value</th></tr>
+      <tr><td><b>Snapshot Name</b></td><td>$($snap.Name)</td></tr>
+      <tr><td><b>Resource Group</b></td><td>$($snap.ResourceGroupName)</td></tr>
       <tr><td><b>Subscription</b></td><td>$($sub.Name)</td></tr>
-      <tr><td><b>Location</b></td><td>$($snapshot.Location)</td></tr>
-      <tr><td><b>Estimated Cost</b></td><td>&#8377;$totalSaved</td></tr>
+      <tr><td><b>Location</b></td><td>$($snap.Location)</td></tr>
+      <tr><td><b>Actual Cost So Far</b></td><td>&#8377;$totalSaved</td></tr>
     </table>
     <p>
-      Our Automation process will <b>delete this snapshot after $daysLeft day(s)</b> unless it is re-attached or marked with <i>DO NOT DELETE</i>. $note
+      As part of our cleanup initiative to optimize cloud usage and reduce unnecessary costs, this resource will be deleted as per the automation schedule. Our Automation process will <b>delete this snapshot after $daysLeft day(s)</b>. $note
     </p>
+    <p>If this resource is still required, please tag it with <i>DO NOT DELETE</i> or reattach it to a disk before the resource gets deleted automatically.</p>
     <p><b>If deleted, this snapshot would save &#8377;$totalSaved.</b></p>
-    <p style="margin-top:20px;">Regards,<br/>Azure Automation Team</p>
+    <p style='margin-top:20px;'>Regards,<br/>Azure Automation Team</p>
   </body>
 </html>
 "@
-            Send-Email -ToEmail $ownerEmail -Subject $subject -BodyHtml $bodyHtml
+                        Send-Email -ToEmail $ownerEmail -Subject $subject -BodyHtml $bodyHtml
         }
 
         elseif ($daysLeft -eq 0) {
             if (-not $doNotDelete) {
-                Remove-AzSnapshot -ResourceGroupName $snapshot.ResourceGroupName -SnapshotName $snapshot.Name -Force
-                Write-Host "🗑️ Deleted Snapshot $($snapshot.Name)"
+                Remove-AzSnapshot -ResourceGroupName $snap.ResourceGroupName -SnapshotName $snap.Name -Force
+                Write-Host "🗑️ Deleted Snapshot $($snap.Name)"
 
-                $subject = "Deleted: Orphaned Snapshot $($snapshot.Name)"
+                $subject = "Deleted: Orphaned Snapshot $($snap.Name)"
                 $bodyHtml = @"
 <html>
-  <body style="font-family: Georgia, serif; font-size:14px; color:#333;">
+  <body style='font-family: Georgia, serif; font-size:14px; color:#333;'>
     <p>Dear Owner,</p>
     <p>
-      The following snapshot has been <b style="color:red;">deleted</b> after 7 days of being unattached. This helps reduce unnecessary cost.
+      The following Snapshot has been <b style='color:red;'>deleted</b> after 7 days of being unattached. This helps reduce unnecessary cost.
     </p>
-    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse; font-family: Georgia, serif;">
-      <tr style="background-color:#f2f2f2;">
-        <th>Property</th>
-        <th>Value</th>
-      </tr>
-      <tr><td><b>Snapshot Name</b></td><td>$($snapshot.Name)</td></tr>
-      <tr><td><b>Resource Group</b></td><td>$($snapshot.ResourceGroupName)</td></tr>
+    <table border='1' cellpadding='6' cellspacing='0' style='border-collapse: collapse;'>
+      <tr style='background-color:#f2f2f2;'><th>Property</th><th>Value</th></tr>
+      <tr><td><b>Snapshot Name</b></td><td>$($snap.Name)</td></tr>
+      <tr><td><b>Resource Group</b></td><td>$($snap.ResourceGroupName)</td></tr>
       <tr><td><b>Subscription</b></td><td>$($sub.Name)</td></tr>
-      <tr><td><b>Location</b></td><td>$($snapshot.Location)</td></tr>
-      <tr><td><b>Cost Saved</b></td><td>&#8377;$totalSaved</td></tr>
+      <tr><td><b>Location</b></td><td>$($snap.Location)</td></tr>
+      <tr><td><b>Actual Cost Saved</b></td><td>&#8377;$totalSaved</td></tr>
     </table>
-    <p style="color:green;"><b>Snapshot deleted successfully.</b> Thank you for helping optimize cloud costs!</p>
-    <p>Regards,<br/>Azure Automation Team<br/></p>
+    <p style='color:green;'><b>Snapshot deleted successfully.</b> Thank you for helping optimize cloud costs!</p>
+    <p>Regards,<br/>Azure Automation Team</p>
   </body>
 </html>
 "@
@@ -172,4 +200,4 @@ foreach ($sub in $subscriptions) {
     }
 }
 
-Write-Host "✅ Orphaned NIC cleanup completed."
+Write-Host "✅ Orphaned Snapshot cleanup completed."
