@@ -3,15 +3,17 @@
  Orphaned Disk Notification & Cleanup Runbook
 
 .DESCRIPTION 
- Identifies unattached (orphaned) managed disks across all subscriptions.
+ Identifies unattached managed disks across all subscriptions.
  Tags them with 'OrphanedSince' if not already tagged.
  Sends reminder emails on Day 7, 5, 3, 1.
- Deletes disk on Day 0 and emails cost savings in ₹ INR.
+ Sends protection notice if DO NOT DELETE = yes.
+ Deletes disk on Day 0 and emails actual cost savings in ₹ INR.
 #>
 
 Import-Module Az.Accounts
 Import-Module Az.Compute
 Import-Module Az.Resources
+Import-Module Az.CostManagement
 
 Connect-AzAccount -Identity
 
@@ -55,15 +57,22 @@ function Send-Email {
     }
 }
 
-function Estimate-Cost {
+function Get-ActualDiskCost {
     param (
-        [int]$SizeGB,
-        [string]$Sku
+        [string]$resourceId,
+        [datetime]$startDate,
+        [datetime]$endDate
     )
-    switch ($Sku) {
-        "Standard_LRS" { return [math]::Round($SizeGB * 4.5, 2) }     # ₹4.5/GB
-        "Premium_LRS"  { return [math]::Round($SizeGB * 10.5, 2) }    # ₹10.5/GB
-        default        { return [math]::Round($SizeGB * 7.5, 2) }     # ₹7.5/GB
+
+    try {
+        $usageDetails = Get-ConsumptionUsageDetail -StartDate $startDate -EndDate $endDate
+        $diskUsage = $usageDetails | Where-Object { $_.InstanceId -eq $resourceId }
+        $totalCost = ($diskUsage | Measure-Object -Property PreTaxCost -Sum).Sum
+        return [math]::Round($totalCost, 2)
+    }
+    catch {
+        Write-Host "⚠️ Failed to retrieve actual cost for $resourceId. Falling back to estimate."
+        return [math]::Round(2.00 * (($endDate - $startDate).Days), 2)
     }
 }
 
@@ -74,10 +83,9 @@ foreach ($sub in $subscriptions) {
     Set-AzContext -SubscriptionId $sub.Id
     Write-Host "🔍 Checking subscription: $($sub.Name)"
 
-    $disks = Get-AzDisk
-    foreach ($disk in $disks) {
-        if ($disk.ManagedBy) { continue }
+    $disks = Get-AzDisk | Where-Object { -not $_.ManagedBy }
 
+    foreach ($disk in $disks) {
         $diskResource = Get-AzResource -ResourceId $disk.Id
         $tags = $diskResource.Tags
 
@@ -86,24 +94,43 @@ foreach ($sub in $subscriptions) {
         if (-not $tags.ContainsKey("OrphanedSince")) {
             $tags["OrphanedSince"] = $today.ToString("yyyy-MM-dd")
             Set-AzResource -ResourceId $disk.Id -Tag $tags -Force
-            Write-Host "🏷️ Tagged disk $($disk.Name) with OrphanedSince=$($tags["OrphanedSince"])"
-            continue
+            Write-Host "🏷️ Tagged Disk $($disk.Name) with OrphanedSince=$($tags["OrphanedSince"])"
         }
-
-# TESTING ONLY: Simulate different reminder stages
-# Uncomment the one you want to test
-
-# $tags["OrphanedSince"] = ($today.AddDays(-0)).ToString("yyyy-MM-dd")  # Day 7
-# $tags["OrphanedSince"] = ($today.AddDays(-2)).ToString("yyyy-MM-dd")  # Day 5
-# $tags["OrphanedSince"] = ($today.AddDays(-4)).ToString("yyyy-MM-dd")  # Day 3
-# $tags["OrphanedSince"] = ($today.AddDays(-6)).ToString("yyyy-MM-dd")  # Day 1
-# $tags["OrphanedSince"] = ($today.AddDays(-7)).ToString("yyyy-MM-dd")  # Day 0 (deletion)
 
         Set-AzResource -ResourceId $disk.Id -Tag $tags -Force
 
         $orphanedDate = [datetime]::ParseExact($tags["OrphanedSince"], "yyyy-MM-dd", $null)
         $daysOrphaned = ($today - $orphanedDate).Days
         $daysLeft = 7 - $daysOrphaned
+        $totalSaved = Get-ActualDiskCost -resourceId $disk.Id -startDate $orphanedDate -endDate $today
+        $doNotDelete = $tags.ContainsKey("DO NOT DELETE") -and $tags["DO NOT DELETE"].ToLower() -eq "yes"
+
+        if ($doNotDelete) {
+            $subject = "Info: Disk $($disk.Name) is protected from deletion"
+            $bodyHtml = @"
+<html>
+  <body style='font-family: Georgia, serif; font-size:14px; color:#333;'>
+    <p>Dear Owner,</p>
+    <p>
+      The following <b style='color:green;'>Managed Disk</b> is currently unattached but has been tagged with <b>DO NOT DELETE = yes</b>.
+    </p>
+    <table border='1' cellpadding='6' cellspacing='0' style='border-collapse: collapse;'>
+      <tr style='background-color:#f2f2f2;'><th>Property</th><th>Value</th></tr>
+      <tr><td><b>Disk Name</b></td><td>$($disk.Name)</td></tr>
+      <tr><td><b>Resource Group</b></td><td>$($disk.ResourceGroupName)</td></tr>
+      <tr><td><b>Subscription</b></td><td>$($sub.Name)</td></tr>
+      <tr><td><b>Location</b></td><td>$($disk.Location)</td></tr>
+      <tr><td><b>Current Cost</b></td><td>&#8377;$totalSaved</td></tr>
+    </table>
+    <p>This resource is <b>excluded from automated deletion</b>. No action is required from your end at the moment.</p>
+    <p>We encourage periodic review to ensure it's still needed. If not, please update the tag value to allow automated cleanup.</p>
+    <p style='margin-top:20px;'>Regards,<br/>Azure Automation Team</p>
+  </body>
+</html>
+"@
+            Send-Email -ToEmail $ownerEmail -Subject $subject -BodyHtml $bodyHtml
+            continue
+        }
 
         if ($daysLeft -in @(7,5,3,1)) {
             switch ($daysLeft) {
@@ -116,26 +143,25 @@ foreach ($sub in $subscriptions) {
             $subject = "Reminder: Disk $($disk.Name) will be deleted in $daysLeft day(s)"
             $bodyHtml = @"
 <html>
-  <body style="font-family: Georgia, serif; font-size:14px; color:#333;">
+  <body style='font-family: Georgia, serif; font-size:14px; color:#333;'>
     <p>Dear Owner, Good Day...</p>
     <p>
-      This is to notify you that the following <b style="color:red;">Managed Disk</b> in your subscription is currently in <b>unattached (orphaned)</b> and may incur unnecessary cost:
+    We’ve identified the following orphaned resource <b style='color:red;'>Managed Disk</b> under your subscription that is currently unused and not linked to any virtual machine:
     </p>
-    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse; font-family: Georgia, serif;">
-      <tr style="background-color:#f2f2f2;">
-        <th>Property</th>
-        <th>Value</th>
-      </tr>
+    <table border='1' cellpadding='6' cellspacing='0' style='border-collapse: collapse;'>
+      <tr style='background-color:#f2f2f2;'><th>Property</th><th>Value</th></tr>
       <tr><td><b>Disk Name</b></td><td>$($disk.Name)</td></tr>
       <tr><td><b>Resource Group</b></td><td>$($disk.ResourceGroupName)</td></tr>
       <tr><td><b>Subscription</b></td><td>$($sub.Name)</td></tr>
-      <tr><td><b>Disk Size</b></td><td>$($disk.DiskSizeGb) GB</td></tr>
-      <tr><td><b>Disk SKU</b></td><td>$($disk.Sku.Name)</td></tr>
+      <tr><td><b>Location</b></td><td>$($disk.Location)</td></tr>
+      <tr><td><b>Actual Cost So Far</b></td><td>&#8377;$totalSaved</td></tr>
     </table>
     <p>
-      Our Automation process will <b>delete this Disk after $daysLeft day(s)</b> unless it is re-attached or marked with <i>DO NOT DELETE</i>. $note
+      As part of our cleanup initiative to optimize cloud usage and reduce unnecessary costs, this resource will be deleted as per the automation schedule. Our Automation process will <b>delete this disk after $daysLeft day(s)</b>. $note
     </p>
-    <p style="margin-top:20px;">Regards,<br/>Azure Automation Team</p>
+    <p>If this resource is still required, please tag it with <i>DO NOT DELETE</i> or reattach it to a VM before the resource gets deleted automatically.</p>
+    <p><b>If deleted, this disk would save &#8377;$totalSaved.</b></p>
+    <p style='margin-top:20px;'>Regards,<br/>Azure Automation Team</p>
   </body>
 </html>
 "@
@@ -143,41 +169,35 @@ foreach ($sub in $subscriptions) {
         }
 
         elseif ($daysLeft -eq 0) {
-            $monthlyCost = Estimate-Cost -SizeGB $disk.DiskSizeGb -Sku $disk.Sku.Name
-            $dailyCost = [math]::Round($monthlyCost / 30, 2)
-            $totalSaved = [math]::Round($dailyCost * $daysOrphaned, 2)
+            if (-not $doNotDelete) {
+                Remove-AzDisk -ResourceGroupName $disk.ResourceGroupName -DiskName $disk.Name -Force
+                Write-Host "🗑️ Deleted Disk $($disk.Name)"
 
-            Remove-AzDisk -ResourceGroupName $disk.ResourceGroupName -DiskName $disk.Name -Force
-            Write-Host "🗑️ Deleted disk $($disk.Name)"
-
-            $subject = "Deleted: Orphaned Disk $($disk.Name)"
-            $bodyHtml = @"
+                $subject = "Deleted: Orphaned Disk $($disk.Name)"
+                $bodyHtml = @"
 <html>
-  <body style="font-family: Georgia, serif; font-size:14px; color:#333;">
+  <body style='font-family: Georgia, serif; font-size:14px; color:#333;'>
     <p>Dear Owner,</p>
     <p>
-      The following disk has been <b style="color:red;">deleted</b> after 7 days of being unattached. This action helps reduce unnecessary cost and optimize your cloud usage.
+      The following Managed Disk has been <b style='color:red;'>deleted</b> after 7 days of being unattached. This helps reduce unnecessary cost.
     </p>
-    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse; font-family: Georgia, serif;">
-      <tr style="background-color:#f2f2f2;">
-        <th>Property</th>
-        <th>Value</th>
-      </tr>
+    <table border='1' cellpadding='6' cellspacing='0' style='border-collapse: collapse;'>
+      <tr style='background-color:#f2f2f2;'><th>Property</th><th>Value</th></tr>
       <tr><td><b>Disk Name</b></td><td>$($disk.Name)</td></tr>
       <tr><td><b>Resource Group</b></td><td>$($disk.ResourceGroupName)</td></tr>
       <tr><td><b>Subscription</b></td><td>$($sub.Name)</td></tr>
-      <tr><td><b>Disk Size</b></td><td>$($disk.DiskSizeGb) GB</td></tr>
-      <tr><td><b>Disk SKU</b></td><td>$($disk.Sku.Name)</td></tr>
-      <tr><td><b>Cost Saved</b></td><td>INR$totalSaved</td></tr>
+      <tr><td><b>Location</b></td><td>$($disk.Location)</td></tr>
+      <tr><td><b>Actual Cost Saved</b></td><td>&#8377;$totalSaved</td></tr>
     </table>
-    <p style="color:green;"><b>Disk deleted successfully.</b> Thank you for helping optimize cloud costs!</p>
-    <p>Regards,<br/>Azure Automation Team<br/></p>
+    <p style='color:green;'><b>Disk deleted successfully.</b> Thank you for helping optimize cloud costs!</p>
+    <p>Regards,<br/>Azure Automation Team</p>
   </body>
 </html>
 "@
-            Send-Email -ToEmail $ownerEmail -Subject $subject -BodyHtml $bodyHtml
+                Send-Email -ToEmail $ownerEmail -Subject $subject -BodyHtml $bodyHtml
+            }
         }
     }
 }
 
-Write-Host "✅ Orphaned disk cleanup completed."
+Write-Host "✅ Orphaned Disk cleanup completed."
