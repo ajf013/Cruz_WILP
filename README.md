@@ -86,6 +86,3 @@ For each subscription:
             If days left = 0:
                 Delete resource
                 Send deletion confirmation with cost saved
-
-Regards,
-Azure Automation team
